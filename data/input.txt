@@ -1,0 +1,1275 @@
+
+// ===== FILE: controllers/articles.js =====
+
+const {
+  AlreadyTakenError,
+  FieldRequiredError,
+  ForbiddenError,
+  NotFoundError,
+  UnauthorizedError,
+} = require("../helper/customErrors");
+const {
+  appendFollowers,
+  appendFavorites,
+  appendTagList,
+  slugify,
+} = require("../helper/helpers");
+const { Article, Tag, User } = require("../models");
+
+const includeOptions = [
+  { model: Tag, as: "tagList", attributes: ["name"] },
+  { model: User, as: "author", attributes: { exclude: ["email"] } },
+];
+
+//? All Articles - by Author/by Tag/Favorited by user
+const allArticles = async (req, res, next) => {
+  try {
+    const { loggedUser } = req;
+
+    const { author, tag, favorited, limit = 3, offset = 0 } = req.query;
+    const searchOptions = {
+      include: [
+        {
+          model: Tag,
+          as: "tagList",
+          attributes: ["name"],
+          ...(tag && { where: { name: tag } }),
+        },
+        {
+          model: User,
+          as: "author",
+          attributes: { exclude: ["email"] },
+          ...(author && { where: { username: author } }),
+        },
+      ],
+      limit: parseInt(limit),
+      offset: offset * limit,
+      order: [["createdAt", "DESC"]],
+    };
+
+    let articles = { rows: [], count: 0 };
+    if (favorited) {
+      const user = await User.findOne({ where: { username: favorited } });
+
+      articles.rows = await user.getFavorites(searchOptions);
+      articles.count = await user.countFavorites();
+    } else {
+      articles = await Article.findAndCountAll(searchOptions);
+    }
+
+    for (let article of articles.rows) {
+      const articleTags = await article.getTagList();
+
+      appendTagList(articleTags, article);
+      await appendFollowers(loggedUser, article);
+      await appendFavorites(loggedUser, article);
+
+      delete article.dataValues.Favorites;
+    }
+
+    res.json({ articles: articles.rows, articlesCount: articles.count });
+  } catch (error) {
+    next(error);
+  }
+};
+
+//* Create Article
+const createArticle = async (req, res, next) => {
+  try {
+    const { loggedUser } = req;
+    if (!loggedUser) throw new UnauthorizedError();
+
+    const { title, description, body, tagList } = req.body.article;
+    if (!title) throw new FieldRequiredError("A title");
+    if (!description) throw new FieldRequiredError("A description");
+    if (!body) throw new FieldRequiredError("An article body");
+
+    const slug = slugify(title);
+    const slugInDB = await Article.findOne({ where: { slug: slug } });
+    if (slugInDB) throw new AlreadyTakenError("Title");
+
+    const article = await Article.create({
+      slug: slug,
+      title: title,
+      description: description,
+      body: body,
+    });
+
+    for (const tag of tagList) {
+      const tagInDB = await Tag.findByPk(tag.trim());
+
+      if (tagInDB) {
+        await article.addTagList(tagInDB);
+      } else if (tag.length > 2) {
+        const newTag = await Tag.create({ name: tag.trim() });
+
+        await article.addTagList(newTag);
+      }
+    }
+
+    delete loggedUser.dataValues.token;
+
+    article.dataValues.tagList = tagList;
+    article.setAuthor(loggedUser);
+    article.dataValues.author = loggedUser;
+    await appendFollowers(loggedUser, loggedUser);
+    await appendFavorites(loggedUser, article);
+
+    res.status(201).json({ article });
+  } catch (error) {
+    next(error);
+  }
+};
+
+//* Feed
+const articlesFeed = async (req, res, next) => {
+  try {
+    const { loggedUser } = req;
+    if (!loggedUser) throw new UnauthorizedError();
+
+    const { limit = 3, offset = 0 } = req.query;
+    const authors = await loggedUser.getFollowing();
+
+    const articles = await Article.findAndCountAll({
+      include: includeOptions,
+      limit: parseInt(limit),
+      offset: offset * limit,
+      order: [["createdAt", "DESC"]],
+      where: { userId: authors.map((author) => author.id) },
+    });
+
+    for (const article of articles.rows) {
+      const articleTags = await article.getTagList();
+
+      appendTagList(articleTags, article);
+      await appendFollowers(loggedUser, article);
+      await appendFavorites(loggedUser, article);
+    }
+
+    res.json({ articles: articles.rows, articlesCount: articles.count });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Single Article by slug
+const singleArticle = async (req, res, next) => {
+  try {
+    const { loggedUser } = req;
+
+    const { slug } = req.params;
+    const article = await Article.findOne({
+      where: { slug: slug },
+      include: includeOptions,
+    });
+    if (!article) throw new NotFoundError("Article");
+
+    appendTagList(article.tagList, article);
+    await appendFollowers(loggedUser, article);
+    await appendFavorites(loggedUser, article);
+
+    res.json({ article });
+  } catch (error) {
+    next(error);
+  }
+};
+
+//* Update Article
+const updateArticle = async (req, res, next) => {
+  try {
+    const { loggedUser } = req;
+    if (!loggedUser) throw new UnauthorizedError();
+
+    const { slug } = req.params;
+    const article = await Article.findOne({
+      where: { slug: slug },
+      include: includeOptions,
+    });
+    if (!article) throw new NotFoundError("Article");
+
+    if (loggedUser.id !== article.author.id) {
+      throw new ForbiddenError("article");
+    }
+
+    const { title, description, body } = req.body.article;
+    if (title) {
+      article.slug = slugify(title);
+      article.title = title;
+    }
+    if (description) article.description = description;
+    if (body) article.body = body;
+    await article.save();
+
+    appendTagList(article.tagList, article);
+    await appendFollowers(loggedUser, article);
+    await appendFavorites(loggedUser, article);
+
+    res.json({ article });
+  } catch (error) {
+    next(error);
+  }
+};
+
+//* Delete Article
+const deleteArticle = async (req, res, next) => {
+  try {
+    const { loggedUser } = req;
+    if (!loggedUser) throw new UnauthorizedError();
+
+    const { slug } = req.params;
+    const article = await Article.findOne({
+      where: { slug: slug },
+      include: includeOptions,
+    });
+    if (!article) throw new NotFoundError("Article");
+
+    if (loggedUser.id !== article.author.id) {
+      throw new ForbiddenError("article");
+    }
+
+    await article.destroy();
+
+    res.json({ message: { body: ["Article deleted successfully"] } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = {
+  allArticles,
+  createArticle,
+  singleArticle,
+  updateArticle,
+  deleteArticle,
+  articlesFeed,
+};
+
+
+
+// ===== FILE: controllers/comments.js =====
+
+const {
+  NotFoundError,
+  UnauthorizedError,
+  FieldRequiredError,
+  ForbiddenError,
+} = require("../helper/customErrors");
+const { appendFollowers } = require("../helper/helpers");
+const { Article, Comment, User } = require("../models");
+
+//? All Comments for Article
+const allComments = async (req, res, next) => {
+  try {
+    const { loggedUser } = req;
+    const { slug } = req.params;
+
+    const article = await Article.findOne({ where: { slug: slug } });
+    if (!article) throw new NotFoundError("Article");
+
+    const comments = await article.getComments({
+      include: [
+        { model: User, as: "author", attributes: { exclude: ["email"] } },
+      ],
+    });
+
+    for (const comment of comments) {
+      await appendFollowers(loggedUser, comment);
+    }
+
+    res.json({ comments });
+  } catch (error) {
+    next(error);
+  }
+};
+
+//* Create Comment for Article
+const createComment = async (req, res, next) => {
+  try {
+    const { loggedUser } = req;
+    if (!loggedUser) throw new UnauthorizedError();
+
+    const { body } = req.body.comment;
+    if (!body) throw new FieldRequiredError("Comment body");
+
+    const { slug } = req.params;
+    const article = await Article.findOne({ where: { slug: slug } });
+    if (!article) throw new NotFoundError("Article");
+
+    const comment = await Comment.create({
+      body: body,
+      articleId: article.id,
+      userId: loggedUser.id,
+    });
+
+    delete loggedUser.dataValues.token;
+    comment.dataValues.author = loggedUser;
+    await appendFollowers(loggedUser, loggedUser);
+
+    res.status(201).json({ comment });
+  } catch (error) {
+    next(error);
+  }
+};
+
+//* Delete Comment for Article
+const deleteComment = async (req, res, next) => {
+  try {
+    const { loggedUser } = req;
+    if (!loggedUser) throw new UnauthorizedError();
+
+    const { slug, commentId } = req.params;
+
+    const comment = await Comment.findByPk(commentId);
+    if (!comment) throw new NotFoundError("Comment");
+
+    if (loggedUser.id !== comment.userId) {
+      throw new ForbiddenError("comment");
+    }
+
+    await comment.destroy();
+
+    res.json({ message: { body: ["Comment deleted successfully"] } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = { allComments, createComment, deleteComment };
+
+
+
+// ===== FILE: controllers/favorites.js =====
+
+const { UnauthorizedError, NotFoundError } = require("../helper/customErrors");
+const {
+  appendFollowers,
+  appendFavorites,
+  appendTagList,
+} = require("../helper/helpers");
+const { Article, Tag, User } = require("../models");
+
+//*  Favorite/Unfavorite Article
+const favoriteToggler = async (req, res, next) => {
+  try {
+    const { loggedUser } = req;
+    if (!loggedUser) throw new UnauthorizedError();
+
+    const { slug } = req.params;
+
+    const article = await Article.findOne({
+      where: { slug: slug },
+      include: [
+        {
+          model: Tag,
+          as: "tagList",
+          attributes: ["name"],
+        },
+        {
+          model: User,
+          as: "author",
+          attributes: ["username", "bio", "image" /* "following" */],
+        },
+      ],
+    });
+    if (!article) throw new NotFoundError("Article");
+
+    if (req.method === "POST") await article.addUser(loggedUser);
+    if (req.method === "DELETE") await article.removeUser(loggedUser);
+
+    appendTagList(article.tagList, article);
+    await appendFollowers(loggedUser, article);
+    await appendFavorites(loggedUser, article);
+
+    res.json({ article });
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = { favoriteToggler };
+
+
+
+// ===== FILE: controllers/profiles.js =====
+
+const { UnauthorizedError, NotFoundError } = require("../helper/customErrors");
+const { appendFollowers } = require("../helper/helpers");
+const { User } = require("../models");
+
+//? Profile
+const getProfile = async (req, res, next) => {
+  try {
+    const { loggedUser } = req;
+    const { username } = req.params;
+
+    const profile = await User.findOne({
+      where: { username: username },
+      attributes: { exclude: "email" },
+    });
+    if (!profile) throw new NotFoundError("User profile");
+
+    await appendFollowers(loggedUser, profile);
+
+    res.json({ profile });
+  } catch (error) {
+    next(error);
+  }
+};
+
+//* Follow/Unfollow Profile
+const followToggler = async (req, res, next) => {
+  try {
+    const { loggedUser } = req;
+    if (!loggedUser) throw new UnauthorizedError();
+
+    const { username } = req.params;
+
+    const profile = await User.findOne({
+      where: { username: username },
+      attributes: { exclude: "email" },
+    });
+    if (!profile) throw new NotFoundError("User profile");
+
+    if (req.method === "POST") {
+      await profile.addFollower(loggedUser);
+    } else if (req.method === "DELETE") {
+      await profile.removeFollower(loggedUser);
+    }
+
+    await appendFollowers(loggedUser, profile);
+
+    res.json({ profile });
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = { getProfile, followToggler };
+
+
+
+// ===== FILE: controllers/user.js =====
+
+const { UnauthorizedError } = require("../helper/customErrors");
+const { bcryptHash } = require("../helper/bcrypt");
+
+//* Current User
+const currentUser = async (req, res, next) => {
+  try {
+    const { loggedUser } = req;
+    if (!loggedUser) throw new UnauthorizedError();
+
+    loggedUser.dataValues.email = req.headers.email;
+    delete req.headers.email;
+
+    res.json({ user: loggedUser });
+  } catch (error) {
+    next(error);
+  }
+};
+
+//* Update User
+const updateUser = async (req, res, next) => {
+  try {
+    const { loggedUser } = req;
+    if (!loggedUser) throw new UnauthorizedError();
+
+    const {
+      user: { password },
+      user,
+    } = req.body;
+
+    Object.entries(user).forEach((entry) => {
+      const [key, value] = entry;
+
+      if (value !== undefined && key !== "password") loggedUser[key] = value;
+    });
+
+    if (password !== undefined || password !== "") {
+      loggedUser.password = await bcryptHash(password);
+    }
+
+    await loggedUser.save();
+
+    res.json({ user: loggedUser });
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = { currentUser, updateUser };
+
+
+
+// ===== FILE: controllers/users.js =====
+
+const { User } = require("../models");
+const { jwtSign } = require("../helper/jwt");
+const { bcryptHash, bcryptCompare } = require("../helper/bcrypt");
+const {
+  ValidationError,
+  FieldRequiredError,
+  AlreadyTakenError,
+  NotFoundError,
+} = require("../helper/customErrors");
+
+// Register
+const signUp = async (req, res, next) => {
+  try {
+    const { username, email, bio, image, password } = req.body.user;
+    if (!username) throw new FieldRequiredError(`A username`);
+    if (!email) throw new FieldRequiredError(`An email`);
+    if (!password) throw new FieldRequiredError(`A password`);
+
+    const userExists = await User.findOne({
+      where: { email: req.body.user.email },
+    });
+    if (userExists) throw new AlreadyTakenError("Email", "try logging in");
+
+    const newUser = await User.create({
+      email: email,
+      username: username,
+      bio: bio,
+      image: image,
+      password: await bcryptHash(password),
+    });
+
+    newUser.dataValues.token = await jwtSign(newUser);
+
+    res.status(201).json({ user: newUser });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Login
+const signIn = async (req, res, next) => {
+  try {
+    const { user } = req.body;
+
+    const existentUser = await User.findOne({ where: { email: user.email } });
+    if (!existentUser) throw new NotFoundError("Email", "sign in first");
+
+    const pwd = await bcryptCompare(user.password, existentUser.password);
+    if (!pwd) throw new ValidationError("Wrong email/password combination");
+
+    existentUser.dataValues.token = await jwtSign(user);
+
+    res.json({ user: existentUser });
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = { signUp, signIn };
+
+
+
+// ===== FILE: helper/bcrypt.js =====
+
+const bcrypt = require("bcrypt");
+
+module.exports.bcryptHash = async (password) => {
+  return bcrypt.hash(password, 10);
+};
+
+module.exports.bcryptCompare = async (password, hasPwd) => {
+  return bcrypt.compare(password, hasPwd);
+};
+
+
+
+// ===== FILE: helper/customErrors.js =====
+
+class MyError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = this.constructor.name;
+  }
+}
+
+class ForbiddenError extends MyError {
+  constructor(message) {
+    super(`You are not the author of this ${message}`);
+  }
+}
+class NotFoundError extends MyError {
+  constructor(property, message = "") {
+    super(`${property} not found ${message}`);
+  }
+}
+class UnauthorizedError extends MyError {
+  constructor() {
+    super("You need to login first!");
+  }
+}
+
+class ValidationError extends MyError {}
+
+class FieldRequiredError extends ValidationError {
+  constructor(field) {
+    super(`${field} is required`);
+  }
+}
+
+class AlreadyTakenError extends ValidationError {
+  constructor(property, message = "") {
+    super(`${property} already exists.. ${message}`);
+  }
+}
+
+module.exports = {
+  AlreadyTakenError,
+  FieldRequiredError,
+  ForbiddenError,
+  NotFoundError,
+  UnauthorizedError,
+  ValidationError,
+};
+
+
+
+// ===== FILE: helper/helpers.js =====
+
+const slugify = (string) => {
+  return string.trim().toLowerCase().replace(/\W|_/g, "-");
+};
+
+const appendTagList = (articleTags, article) => {
+  const tagList = articleTags.map((tag) => tag.name);
+
+  if (!article) return tagList;
+  article.dataValues.tagList = tagList;
+};
+
+const appendFavorites = async (loggedUser, article) => {
+  const favorited = await article.hasUser(loggedUser ? loggedUser : null);
+  article.dataValues.favorited = loggedUser ? favorited : false;
+
+  const favoritesCount = await article.countUsers();
+  article.dataValues.favoritesCount = favoritesCount;
+};
+
+const appendFollowers = async (loggedUser, toAppend) => {
+  //
+  if (toAppend?.author) {
+    const author = await toAppend.getAuthor();
+
+    const following = await author.hasFollower(loggedUser ? loggedUser : null);
+    toAppend.author.dataValues.following = loggedUser ? following : false;
+
+    const followersCount = await author.countFollowers();
+    toAppend.author.dataValues.followersCount = followersCount;
+    //
+  } else {
+    const following = await toAppend.hasFollower(
+      loggedUser ? loggedUser : null,
+    );
+    toAppend.dataValues.following = loggedUser ? following : false;
+
+    const followersCount = await toAppend.countFollowers();
+    toAppend.dataValues.followersCount = followersCount;
+  }
+};
+
+module.exports = { slugify, appendTagList, appendFavorites, appendFollowers };
+
+
+
+// ===== FILE: helper/helpers.test.js =====
+
+const { slugify } = require("./helpers");
+
+describe("Slugify", () => {
+  const stringsArray = [
+    "  Hello World  ",
+    "  Hello WORLD  ",
+    " HELLO WORLD",
+    "Hello World",
+    "Hello_world ",
+    "Hello-world",
+  ];
+
+  test.each(stringsArray)("%p", (string) => {
+    expect(slugify(string)).toBe("hello-world");
+  });
+});
+
+
+
+// ===== FILE: helper/jwt.js =====
+
+const jwt = require("jsonwebtoken");
+const privateKey = process.env.JWT_KEY;
+
+module.exports.jwtSign = async (payload) => {
+  return jwt.sign(
+    { username: payload.username, email: payload.email },
+    privateKey,
+  );
+};
+
+module.exports.jwtVerify = async (token) => {
+  return jwt.verify(token, privateKey);
+};
+
+
+
+// ===== FILE: index.js =====
+
+require("dotenv").config();
+const PORT = process.env.PORT || 3001;
+const express = require("express");
+const cors = require("cors");
+const { sequelize } = require("./models");
+const errorHandler = require("./middleware/errorHandler");
+
+const usersRoutes = require("./routes/users");
+const userRoutes = require("./routes/user");
+const articlesRoutes = require("./routes/articles");
+const profilesRoutes = require("./routes/profiles");
+const tagsRoutes = require("./routes/tags");
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+(async () => {
+  try {
+    await sequelize.sync({ alter: true });
+    // await sequelize.authenticate();
+  } catch (error) {
+    console.error(error);
+  }
+})();
+
+if (process.env.NODE_ENV === "production") {
+  app.use(express.static("../frontend/build"));
+} else {
+  app.get("/", (req, res) => res.json({ status: "API is running on /api" }));
+}
+app.use("/api/users", usersRoutes);
+app.use("/api/user", userRoutes);
+app.use("/api/articles", articlesRoutes);
+app.use("/api/profiles", profilesRoutes);
+app.use("/api/tags", tagsRoutes);
+app.get("*", (req, res) =>
+  res.status(404).json({ errors: { body: ["Not found"] } }),
+);
+app.use(errorHandler);
+
+app.listen(PORT, () =>
+  console.log(`Server running on http://localhost:${PORT}`),
+);
+
+
+
+// ===== FILE: middleware/authentication.js =====
+
+const { NotFoundError } = require("../helper/customErrors");
+const { jwtVerify } = require("../helper/jwt");
+const { User } = require("../models");
+
+const verifyToken = async (req, res, next) => {
+  try {
+    const { headers } = req;
+    if (!headers.authorization) return next();
+
+    const token = headers.authorization.split(" ")[1];
+    if (!token) throw new SyntaxError("Token missing or malformed");
+
+    const userVerified = await jwtVerify(token);
+    if (!userVerified) throw new Error("Invalid Token");
+
+    req.loggedUser = await User.findOne({
+      attributes: { exclude: ["email"] },
+      where: { email: userVerified.email },
+    });
+
+    if (!req.loggedUser) next(new NotFoundError("User"));
+
+    headers.email = userVerified.email;
+    req.loggedUser.dataValues.token = token;
+
+    next();
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = verifyToken;
+
+
+
+// ===== FILE: middleware/errorHandler.js =====
+
+const {
+  ForbiddenError,
+  NotFoundError,
+  UnauthorizedError,
+  ValidationError,
+} = require("../helper/customErrors");
+
+const errorHandler = (error, req, res, next) => {
+  console.log("\x1b[31m%s\x1b[0m", "▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼");
+
+  if (error instanceof UnauthorizedError) {
+    console.log(error);
+
+    res.status(401).json({ errors: { body: [error.message] } });
+  } else if (error instanceof ForbiddenError) {
+    console.log(error);
+
+    res.status(403).json({ errors: { body: [error.message] } });
+  } else if (error instanceof NotFoundError) {
+    console.log(error);
+
+    res.status(404).json({ errors: { body: [error.message] } });
+  } else if (error instanceof ValidationError) {
+    console.log(error);
+    res.status(422).json({ errors: { body: [error.message] } });
+  } else {
+    console.log(error);
+    res.status(500).json({ errors: { body: [error.message] } });
+  }
+
+  console.log("\x1b[31m%s\x1b[0m", "▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲");
+};
+
+module.exports = errorHandler;
+
+
+
+// ===== FILE: models/Article.js =====
+
+"use strict";
+const { Model } = require("sequelize");
+module.exports = (sequelize, DataTypes) => {
+  class Article extends Model {
+    /**
+     * Helper method for defining associations.
+     * This method is not a part of Sequelize lifecycle.
+     * The `models/index` file will call this method automatically.
+     */
+    static associate({ User, Tag, Comment }) {
+      // define association here
+
+      // Users
+      this.belongsTo(User, { foreignKey: "userId", as: "author" });
+
+      // Comments
+      this.hasMany(Comment, { foreignKey: "articleId", onDelete: "cascade" });
+
+      // Tag list
+      this.belongsToMany(Tag, {
+        through: "TagList",
+        as: "tagList",
+        foreignKey: "articleId",
+        timestamps: false,
+        onDelete: "cascade", // FIXME: delete tags
+      });
+
+      // Favorites
+      this.belongsToMany(User, {
+        through: "Favorites",
+        foreignKey: "articleId",
+        timestamps: false,
+      });
+    }
+
+    toJSON() {
+      return {
+        ...this.get(),
+        id: undefined,
+        userId: undefined,
+      };
+    }
+  }
+  Article.init(
+    {
+      slug: DataTypes.STRING,
+      title: DataTypes.STRING,
+      description: DataTypes.TEXT,
+      body: DataTypes.TEXT,
+    },
+    {
+      sequelize,
+      modelName: "Article",
+    },
+  );
+  return Article;
+};
+
+
+
+// ===== FILE: models/Comment.js =====
+
+"use strict";
+const { Model } = require("sequelize");
+module.exports = (sequelize, DataTypes) => {
+  class Comment extends Model {
+    /**
+     * Helper method for defining associations.
+     * This method is not a part of Sequelize lifecycle.
+     * The `models/index` file will call this method automatically.
+     */
+    static associate({ User, Article }) {
+      // define association here
+
+      // Comments
+      this.belongsTo(Article, { foreignKey: "articleId" });
+      this.belongsTo(User, { as: "author", foreignKey: "userId" });
+    }
+
+    toJSON() {
+      return {
+        ...this.get(),
+        articleId: undefined,
+        userId: undefined,
+      };
+    }
+  }
+  Comment.init(
+    {
+      id: {
+        allowNull: false,
+        autoIncrement: true,
+        primaryKey: true,
+        type: DataTypes.INTEGER,
+      },
+      body: DataTypes.TEXT,
+    },
+    {
+      sequelize,
+      modelName: "Comment",
+    },
+  );
+  return Comment;
+};
+
+
+
+// ===== FILE: models/Tag.js =====
+
+"use strict";
+const { Model } = require("sequelize");
+module.exports = (sequelize, DataTypes) => {
+  class Tag extends Model {
+    /**
+     * Helper method for defining associations.
+     * This method is not a part of Sequelize lifecycle.
+     * The `models/index` file will call this method automatically.
+     */
+    static associate({ Article }) {
+      // define association here
+
+      // Tag list
+      this.belongsToMany(Article, {
+        through: "TagList",
+        foreignKey: "tagName",
+        timestamps: false,
+      });
+    }
+
+    toJSON() {
+      return {
+        ...this.get(),
+        id: undefined,
+        userId: undefined,
+        TagList: undefined,
+      };
+    }
+  }
+  Tag.init(
+    {
+      name: {
+        type: DataTypes.STRING,
+        allowNull: false,
+        primaryKey: true,
+      },
+    },
+    {
+      sequelize,
+      modelName: "Tag",
+      timestamps: false,
+    },
+  );
+  return Tag;
+};
+
+
+
+// ===== FILE: models/User.js =====
+
+"use strict";
+const { Model } = require("sequelize");
+module.exports = (sequelize, DataTypes) => {
+  class User extends Model {
+    /**
+     * Helper method for defining associations.
+     * This method is not a part of Sequelize lifecycle.
+     * The `models/index` file will call this method automatically.
+     */
+    static associate({ Article, Comment, User }) {
+      // define association here
+
+      // Articles
+      this.hasMany(Article, { foreignKey: "userId", onDelete: "CASCADE" });
+
+      // Comments
+      this.hasMany(Comment, { foreignKey: "articleId" });
+
+      // Favorites
+      this.belongsToMany(Article, {
+        through: "Favorites",
+        as: "favorites",
+        foreignKey: "userId",
+        timestamps: false,
+      });
+
+      // Followers
+      this.belongsToMany(User, {
+        through: "Followers",
+        as: "followers",
+        foreignKey: "userId",
+        timestamps: false,
+      });
+      this.belongsToMany(User, {
+        through: "Followers",
+        as: "following",
+        foreignKey: "followerId",
+        timestamps: false,
+      });
+    }
+
+    toJSON() {
+      return {
+        ...this.get(),
+        id: undefined,
+        password: undefined,
+        updatedAt: undefined,
+        createdAt: undefined,
+      };
+    }
+  }
+  User.init(
+    {
+      email: DataTypes.STRING,
+      username: DataTypes.STRING,
+      bio: DataTypes.TEXT,
+      image: DataTypes.TEXT,
+      password: DataTypes.STRING,
+    },
+    {
+      sequelize,
+      modelName: "User",
+    },
+  );
+  return User;
+};
+
+
+
+// ===== FILE: models/index.js =====
+
+"use strict";
+
+const fs = require("fs");
+const path = require("path");
+const Sequelize = require("sequelize");
+const basename = path.basename(__filename);
+const env = process.env.NODE_ENV || "development";
+const config = require(__dirname + "/../config/config.js")[env];
+const db = {};
+
+console.log(JSON.stringify(config,null,2))
+let sequelize;
+if (config.use_env_variable) {
+  sequelize = new Sequelize(process.env[config.use_env_variable], config);
+} else {
+  sequelize = new Sequelize(
+    config.database,
+    config.username,
+    config.password,
+    config,
+  );
+}
+
+fs.readdirSync(__dirname)
+  .filter((file) => {
+    return (
+      file.indexOf(".") !== 0 && file !== basename && file.slice(-3) === ".js"
+    );
+  })
+  .forEach((file) => {
+    const model = require(path.join(__dirname, file))(
+      sequelize,
+      Sequelize.DataTypes,
+    );
+    db[model.name] = model;
+  });
+
+Object.keys(db).forEach((modelName) => {
+  if (db[modelName].associate) {
+    db[modelName].associate(db);
+  }
+});
+
+db.sequelize = sequelize;
+db.Sequelize = Sequelize;
+
+module.exports = db;
+
+
+
+// ===== FILE: routes/articles.js =====
+
+const express = require("express");
+const router = express.Router();
+const verifyToken = require("../middleware/authentication");
+const {
+  allArticles,
+  createArticle,
+  singleArticle,
+  updateArticle,
+  deleteArticle,
+  articlesFeed,
+} = require("../controllers/articles");
+
+//? All Articles - by Author/by Tag/Favorited by user
+router.get("/", verifyToken, allArticles);
+//* Create Article
+router.post("/", verifyToken, createArticle);
+//* Feed
+router.get("/feed", verifyToken, articlesFeed);
+// Single Article by slug
+router.get("/:slug", verifyToken, singleArticle);
+//* Update Article
+router.put("/:slug", verifyToken, updateArticle);
+//* Delete Article
+router.delete("/:slug", verifyToken, deleteArticle);
+
+const favoritesRoutes = require("./articles/favorites");
+const commentsRoutes = require("./articles/comments");
+
+//> Favorites routes
+router.use("/", favoritesRoutes);
+//> Comments routes
+router.use("/", commentsRoutes);
+
+module.exports = router;
+
+
+
+// ===== FILE: routes/articles/comments.js =====
+
+const express = require("express");
+const router = express.Router();
+const verifyToken = require("../../middleware/authentication");
+const {
+  allComments,
+  createComment,
+  deleteComment,
+} = require("../../controllers/comments");
+
+//? All Comments for Article
+router.get("/:slug/comments", verifyToken, allComments);
+//* Create Comment for Article
+router.post("/:slug/comments", verifyToken, createComment);
+//* Delete Comment for Article
+router.delete("/:slug/comments/:commentId", verifyToken, deleteComment);
+
+module.exports = router;
+
+
+
+// ===== FILE: routes/articles/favorites.js =====
+
+const express = require("express");
+const router = express.Router();
+const verifyToken = require("../../middleware/authentication");
+const { favoriteToggler } = require("../../controllers/favorites");
+
+//* Favorite Article
+router.post("/:slug/favorite", verifyToken, favoriteToggler);
+//* Unfavorite Article
+router.delete("/:slug/favorite", verifyToken, favoriteToggler);
+
+module.exports = router;
+
+
+
+// ===== FILE: routes/profiles.js =====
+
+const express = require("express");
+const router = express.Router();
+const verifyToken = require("../middleware/authentication");
+const { getProfile, followToggler } = require("../controllers/profiles");
+
+//? Profile
+router.get("/:username", verifyToken, getProfile);
+
+//* Follow Profile
+router.post("/:username/follow", verifyToken, followToggler);
+
+//* Unfollow Profile
+router.delete("/:username/follow", verifyToken, followToggler);
+
+module.exports = router;
+
+
+
+// ===== FILE: routes/tags.js =====
+
+const express = require("express");
+const router = express.Router();
+const { Tag } = require("../models");
+const { appendTagList } = require("../helper/helpers");
+
+// All Tags
+router.get("/", async (req, res, next) => {
+  try {
+    const tagList = await Tag.findAll();
+
+    const tags = appendTagList(tagList);
+
+    res.json({ tags });
+  } catch (error) {
+    next(error);
+  }
+});
+
+module.exports = router;
+
+
+
+// ===== FILE: routes/user.js =====
+
+const express = require("express");
+const router = express.Router();
+const verifyToken = require("../middleware/authentication");
+const { currentUser, updateUser } = require("../controllers/user");
+
+//* Current User
+router.get("/", verifyToken, currentUser);
+//* Update User
+router.put("/", verifyToken, updateUser);
+
+module.exports = router;
+
+
+
+// ===== FILE: routes/users.js =====
+
+const express = require("express");
+const router = express.Router();
+const { signUp, signIn } = require("../controllers/users");
+
+// Register
+router.post("/", signUp);
+// Login
+router.post("/login", signIn);
+
+module.exports = router;
+
+
